@@ -312,6 +312,7 @@ def run_ml_forecast(ticker, forecast_days):
                 "mape":      mape_1step,
                 "dir_acc":   dir_acc,
                 "next_ret":  round(next_ret*100, 3),
+                "prob":      round(float(np.mean(pred_rets > 0)) * 100, 1),
                 "signal":    signal,
                 "top5":      top5,
                 "fdf":       fdf,
@@ -576,6 +577,80 @@ def build_forecast_chart(ticker, forecast_days, ml_results, current_price):
                     font=dict(family="Courier New", size=9)),
         font=dict(family="Courier New", color=C["gray"]),
         margin=dict(l=50, r=90, t=70, b=20))
+    fig.update_xaxes(gridcolor="#1a1a1a")
+    fig.update_yaxes(gridcolor="#1a1a1a")
+    return fig
+
+
+@st.cache_data(ttl=300)
+def build_chart(ticker="SPY", period="1mo"):
+    df = fetch_ohlcv(ticker, period)
+    if df.empty or len(df) < 2:
+        fig = go.Figure()
+        fig.add_annotation(text=f"No data for {ticker}", xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(color="#FF3333", size=14, family="Courier New"))
+        fig.update_layout(template="plotly_dark", paper_bgcolor="#000", plot_bgcolor="#0D0D0D")
+        return fig
+    c = df["Close"]
+    df["RSI"]  = rsi(c)
+    df["MACD"], df["Sig"], df["H"] = macd(c)
+    df["BB_up"], df["BB_mid"], df["BB_lo"] = bbands(c)
+    df["EMA20"] = c.ewm(span=20, min_periods=1).mean()
+    df["EMA50"] = c.ewm(span=50, min_periods=1).mean()
+    df   = df[df["Close"].notna() & df["Open"].notna()].copy()
+    last = float(df["Close"].iloc[-1])
+    prev = float(df["Close"].iloc[-2])
+    chg  = last - prev
+    pct  = chg / prev * 100 if prev else 0
+    ct   = C["green"] if chg >= 0 else C["red"]
+    sign = "▲" if chg >= 0 else "▼"
+    plabel = PERIOD_LABELS.get(period, period)
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
+                        row_heights=[.50, .15, .18, .17], vertical_spacing=0.02)
+    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
+        low=df["Low"], close=df["Close"],
+        increasing_line_color=C["green"], decreasing_line_color=C["red"],
+        name=ticker), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_up"],
+        line=dict(color="rgba(150,150,255,0.5)", width=1, dash="dash"),
+        showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_lo"],
+        line=dict(color="rgba(150,150,255,0.5)", width=1, dash="dash"),
+        fill="tonexty", fillcolor="rgba(100,100,255,0.05)",
+        showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA20"],
+        line=dict(color=C["yellow"], width=1.2), name="EMA20"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"],
+        line=dict(color=C["blue"], width=1.2), name="EMA50"), row=1, col=1)
+    vcols = [C["green"] if float(cl) >= float(op) else C["red"]
+             for cl, op in zip(df["Close"], df["Open"])]
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"],
+        marker_color=vcols, showlegend=False, opacity=0.7), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["RSI"],
+        line=dict(color=C["blue"], width=1.2), showlegend=False), row=3, col=1)
+    fig.add_hline(y=70, line=dict(color=C["red"],   dash="dash", width=0.8), row=3, col=1)
+    fig.add_hline(y=30, line=dict(color=C["green"], dash="dash", width=0.8), row=3, col=1)
+    hcols = [C["green"] if v >= 0 else C["red"] for v in df["H"]]
+    fig.add_trace(go.Bar(x=df.index, y=df["H"],
+        marker_color=hcols, showlegend=False, opacity=0.7), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"],
+        line=dict(color=C["blue"],   width=1.2), name="MACD"),   row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["Sig"],
+        line=dict(color=C["orange"], width=1.2), name="Signal"), row=4, col=1)
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#000", plot_bgcolor="#0D0D0D",
+        title=dict(
+            text=(f"<b style='color:{C['orange']}'>{ticker.upper()}</b>"
+                  f"  <span style='color:{ct}'>{fp(last)} {sign} {fc(chg)} ({pct:+.2f}%)</span>"
+                  f"  <span style='color:#555;font-size:11px'>| {plabel}</span>"),
+            font=dict(family="Courier New", size=14), x=0),
+        height=680, xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", x=0, y=1.02,
+                    bgcolor="rgba(0,0,0,0.5)",
+                    font=dict(family="Courier New", size=9)),
+        font=dict(family="Courier New", color=C["gray"]),
+        margin=dict(l=50, r=20, t=55, b=20))
     fig.update_xaxes(gridcolor="#1a1a1a")
     fig.update_yaxes(gridcolor="#1a1a1a")
     return fig
@@ -1203,13 +1278,13 @@ with t7:
 with t6:
     rc6, _ = st.columns([1,11])
     with rc6:
-        if st.button("Refresh", key="rm"): st.cache_data.clear()
+        if st.button("Refresh", key="rm2"): st.cache_data.clear()
     mp = period_buttons("macro_period")
     with st.spinner("Building macro dashboard..."):
         fig = build_macro(mp); st.pyplot(fig,use_container_width=True); plt.close(fig)
 
 with t7:
-    ntk = st.text_input("Ticker", value="SPY", key="nt").upper()
+    ntk = st.text_input("Ticker", value="SPY", key="nt2").upper()
     if ntk:
         q   = batch_quotes((ntk,)).get(ntk, dict(price=0,chg=0,pct=0))
         col = "#00FF41" if q["chg"] >= 0 else "#FF3333"
