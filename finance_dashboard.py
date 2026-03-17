@@ -185,86 +185,171 @@ def make_features(df):
 def run_ml_forecast(ticker, forecast_days):
     """
     Three-model ML suite:
-      1. LightGBM  — next-day direction (up/down probability)
-      2. GARCH(1,1) — volatility forecast for next N days
-      3. Sentiment  — headline sentiment score from recent news
+      1. LightGBM  — direction classifier + price path via cumulative predicted moves
+      2. GARCH(1,1) — volatility forecast
+      3. VADER Sentiment — news headline NLP
     """
     results = {}
 
-    # ── 1. LIGHTGBM DIRECTION CLASSIFIER ─────────────────────
+    # ── 1. LIGHTGBM DIRECTION + PRICE PATH ───────────────────
     try:
         import lightgbm as lgb
         from sklearn.metrics import accuracy_score, roc_auc_score
-        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.preprocessing import StandardScaler
 
         df = fetch_ohlcv(ticker, "2y")
-        if df.empty or len(df) < 100:
-            results["lgb_error"] = "Insufficient data"
+        if df.empty or len(df) < 120:
+            results["lgb_error"] = "Insufficient data (need 2y history)"
         else:
-            X, y, idx = make_features(df)
+            # Features
+            d = df.copy()
+            c = d["Close"]
+            for n in [1,2,3,5,10,20]:
+                d[f"ret{n}"] = c.pct_change(n)
+            for w in [5,10,20,50]:
+                d[f"ma{w}"]  = c.rolling(w).mean()
+                d[f"std{w}"] = c.rolling(w).std()
+            d["ma5_20"]  = d["ma5"]  / d["ma20"]  - 1
+            d["ma10_50"] = d["ma10"] / d["ma50"]  - 1
+            d["bb_pos"]  = (c - d["ma20"]) / (2 * d["std20"])
+            d["rsi14"]   = rsi(c, 14)
+            d["hl_pct"]  = (d["High"] - d["Low"]) / c
+            d["oc_pct"]  = (d["Close"] - d["Open"]) / d["Open"]
+            d["vol_ratio"]= d["Volume"] / d["Volume"].rolling(20).mean()
+            # Target: next-day return (regression, not direction)
+            d["fwd_ret"] = c.pct_change(1).shift(-1)
+            d = d.dropna()
+
+            feat_cols = [f"ret{n}" for n in [1,2,3,5,10,20]] +                         [f"ma{w}" for w in [5,10,20,50]] +                         [f"std{w}" for w in [5,10,20,50]] +                         ["ma5_20","ma10_50","bb_pos","rsi14",
+                         "hl_pct","oc_pct","vol_ratio"]
+
+            X = d[feat_cols]
+            y_ret = d["fwd_ret"]
+            y_dir = (y_ret > 0).astype(int)
+
             n     = len(X)
             split = int(n * 0.8)
             X_tr, X_te = X.iloc[:split], X.iloc[split:]
-            y_tr, y_te = y.iloc[:split], y.iloc[split:]
+            y_tr_dir, y_te_dir = y_dir.iloc[:split], y_dir.iloc[split:]
+            y_tr_ret, y_te_ret = y_ret.iloc[:split], y_ret.iloc[split:]
 
-            model = lgb.LGBMClassifier(
-                n_estimators=300, max_depth=5, learning_rate=0.03,
-                subsample=0.8, colsample_bytree=0.8,
-                min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1,
+            # LightGBM regressor (predict next-day return directly)
+            reg = lgb.LGBMRegressor(
+                n_estimators=500, max_depth=4, learning_rate=0.02,
+                subsample=0.7, colsample_bytree=0.7,
+                min_child_samples=30, reg_alpha=0.1, reg_lambda=1.0,
                 random_state=42, verbose=-1)
-            model.fit(X_tr, y_tr,
-                      eval_set=[(X_te, y_te)],
-                      callbacks=[lgb.early_stopping(30, verbose=False),
-                                 lgb.log_evaluation(-1)])
+            reg.fit(X_tr, y_tr_ret,
+                    eval_set=[(X_te, y_te_ret)],
+                    callbacks=[lgb.early_stopping(50, verbose=False),
+                               lgb.log_evaluation(-1)])
 
-            y_prob = model.predict_proba(X_te)[:,1]
-            y_pred = (y_prob >= 0.5).astype(int)
+            pred_ret_test = reg.predict(X_te)
+            pred_dir_test = (pred_ret_test > 0).astype(int)
 
-            acc = round(accuracy_score(y_te, y_pred) * 100, 1)
-            auc = round(roc_auc_score(y_te, y_prob), 3)
+            acc = round(accuracy_score(y_te_dir, pred_dir_test) * 100, 1)
+            try:
+                auc = round(roc_auc_score(y_te_dir, pred_ret_test), 3)
+            except:
+                auc = 0.0
 
-            # Next-day prediction
-            last_X = X.iloc[[-1]]
-            next_prob = float(model.predict_proba(last_X)[0,1])
-            signal = "BUY" if next_prob >= 0.55 else ("SELL" if next_prob <= 0.45 else "HOLD")
+            # Backtest: reconstruct price from predicted returns
+            last_train_price = float(df["Close"].iloc[split])
+            bt_prices = [last_train_price]
+            for r in pred_ret_test:
+                bt_prices.append(bt_prices[-1] * (1 + float(r)))
+            bt_prices = bt_prices[1:]
 
-            # Feature importance top 5
-            fi = pd.Series(model.feature_importances_, index=X.columns)
+            # Next-day signal
+            last_X   = X.iloc[[-1]]
+            next_ret = float(reg.predict(last_X)[0])
+            next_prob_up = float((next_ret > 0))  # simple direction
+            # Use a softer signal based on magnitude
+            if next_ret > 0.003:  signal = "BUY"
+            elif next_ret < -0.003: signal = "SELL"
+            else: signal = "HOLD"
+
+            # Walk-forward price forecast
+            last_price  = float(df["Close"].iloc[-1])
+            last_date   = df.index[-1]
+            temp_df     = df.copy()
+            future_prices = [last_price]
+            future_rets   = []
+
+            for _ in range(forecast_days):
+                try:
+                    td = temp_df.copy()
+                    tc = td["Close"]
+                    for nn in [1,2,3,5,10,20]:
+                        td[f"ret{nn}"] = tc.pct_change(nn)
+                    for ww in [5,10,20,50]:
+                        td[f"ma{ww}"]  = tc.rolling(ww).mean()
+                        td[f"std{ww}"] = tc.rolling(ww).std()
+                    td["ma5_20"]   = td["ma5"]  / td["ma20"]  - 1
+                    td["ma10_50"]  = td["ma10"] / td["ma50"]  - 1
+                    td["bb_pos"]   = (tc - td["ma20"]) / (2 * td["std20"])
+                    td["rsi14"]    = rsi(tc, 14)
+                    td["hl_pct"]   = (td["High"] - td["Low"]) / tc
+                    td["oc_pct"]   = (td["Close"] - td["Open"]) / td["Open"]
+                    td["vol_ratio"]= td["Volume"] / td["Volume"].rolling(20).mean()
+                    td = td.dropna()
+                    if td.empty: break
+                    xf       = td[feat_cols].iloc[[-1]]
+                    pred_r   = float(reg.predict(xf)[0])
+                    # Shrink extreme predictions toward zero to avoid drift
+                    pred_r   = np.clip(pred_r, -0.03, 0.03)
+                    new_p    = future_prices[-1] * (1 + pred_r)
+                    future_prices.append(new_p)
+                    future_rets.append(pred_r)
+                    new_row             = temp_df.iloc[-1:].copy()
+                    new_row.index       = [new_row.index[-1] + pd.tseries.offsets.BDay(1)]
+                    new_row["Close"]    = new_p
+                    new_row["Open"]     = new_p
+                    new_row["High"]     = new_p * (1 + abs(pred_r) * 0.5)
+                    new_row["Low"]      = new_p * (1 - abs(pred_r) * 0.5)
+                    new_row["Volume"]   = float(temp_df["Volume"].rolling(20).mean().iloc[-1])
+                    temp_df = pd.concat([temp_df, new_row])
+                except Exception as fe:
+                    break
+
+            fut_dates = pd.bdate_range(
+                start=last_date + pd.tseries.offsets.BDay(1),
+                periods=len(future_prices)-1)
+            all_dates  = [last_date]   + list(fut_dates)
+            all_prices = future_prices[:len(all_dates)]
+
+            future_df = pd.DataFrame({"price": all_prices}, index=all_dates)
+
+            # Confidence band: ±1 rolling std of predicted returns
+            if future_rets:
+                avg_abs = float(np.mean(np.abs(future_rets)))
+                band    = [last_price * avg_abs * (i+1)**0.5 for i in range(len(fut_dates))]
+                future_df.loc[future_df.index[1:], "upper"] = [p + b for p, b in zip(all_prices[1:], band)]
+                future_df.loc[future_df.index[1:], "lower"] = [p - b for p, b in zip(all_prices[1:], band)]
+            else:
+                future_df["upper"] = future_df["price"]
+                future_df["lower"] = future_df["price"]
+
+            # Feature importance
+            fi   = pd.Series(reg.feature_importances_, index=feat_cols)
             top5 = fi.nlargest(5).to_dict()
 
-            # Walk-forward direction probabilities for next N days
-            temp_df = df.copy()
-            future_probs = [next_prob]
-            for _ in range(forecast_days - 1):
-                try:
-                    Xf, _, _ = make_features(temp_df)
-                    if Xf.empty: break
-                    p = float(model.predict_proba(Xf.iloc[[-1]])[0,1])
-                    future_probs.append(p)
-                    new_row = temp_df.iloc[-1:].copy()
-                    new_row.index = [new_row.index[-1] + pd.tseries.offsets.BDay(1)]
-                    close_chg = 1.005 if p >= 0.5 else 0.995
-                    new_row["Close"] = float(temp_df["Close"].iloc[-1]) * close_chg
-                    new_row["Open"]  = new_row["Close"]
-                    new_row["High"]  = new_row["Close"] * 1.003
-                    new_row["Low"]   = new_row["Close"] * 0.997
-                    temp_df = pd.concat([temp_df, new_row])
-                except: break
-
-            last_date  = df.index[-1]
-            fut_dates  = pd.bdate_range(start=last_date + pd.tseries.offsets.BDay(1),
-                                        periods=len(future_probs))
-            future_dir = pd.DataFrame({"prob_up": future_probs}, index=fut_dates)
+            # Backtest dataframe
+            bt_idx = d.index[split:]
+            bt_df  = pd.DataFrame({
+                "actual":    [float(v) for v in df["Close"].loc[bt_idx].values],
+                "predicted": bt_prices[:len(bt_idx)],
+            }, index=bt_idx)
 
             results["lgb"] = {
-                "acc": acc, "auc": auc,
-                "next_prob": round(next_prob * 100, 1),
-                "signal": signal,
-                "top5": top5,
-                "future_dir": future_dir,
-                "backtest_dates": idx[split:],
-                "backtest_probs": y_prob,
-                "backtest_actual": y_te.values,
+                "acc":        acc,
+                "auc":        auc,
+                "next_ret":   round(next_ret * 100, 3),
+                "next_prob":  round(float(np.mean(pred_ret_test > 0)) * 100, 1),
+                "signal":     signal,
+                "top5":       top5,
+                "future_df":  future_df,
+                "bt_df":      bt_df,
             }
     except Exception as e:
         results["lgb_error"] = str(e)
@@ -281,40 +366,36 @@ def run_ml_forecast(ticker, forecast_days):
             garch = arch_model(rets, vol="Garch", p=1, q=1, dist="normal")
             res   = garch.fit(disp="off", show_warning=False)
             fc    = res.forecast(horizon=forecast_days, reindex=False)
-            vol_forecast = np.sqrt(fc.variance.values[-1])  # daily vol %
-            ann_vol = vol_forecast * np.sqrt(252)
-            current_vol = float(rets.rolling(20).std().iloc[-1]) * np.sqrt(252)
+            vol_f = np.sqrt(fc.variance.values[-1])
+            ann_v = vol_f * np.sqrt(252)
+            cur_v = float(rets.rolling(20).std().iloc[-1]) * np.sqrt(252)
 
-            last_date = df2.index[-1]
-            fut_dates = pd.bdate_range(start=last_date + pd.tseries.offsets.BDay(1),
-                                       periods=forecast_days)
-            vol_df = pd.DataFrame({
-                "daily_vol": vol_forecast,
-                "ann_vol":   ann_vol
-            }, index=fut_dates)
+            last_date2 = df2.index[-1]
+            fut_dates2 = pd.bdate_range(
+                start=last_date2 + pd.tseries.offsets.BDay(1),
+                periods=forecast_days)
+            vol_df = pd.DataFrame({"daily_vol": vol_f, "ann_vol": ann_v}, index=fut_dates2)
 
             results["garch"] = {
                 "vol_df":      vol_df,
-                "current_vol": round(current_vol, 2),
-                "peak_vol":    round(float(ann_vol.max()), 2),
-                "avg_vol":     round(float(ann_vol.mean()), 2),
+                "current_vol": round(cur_v, 2),
+                "peak_vol":    round(float(ann_v.max()), 2),
+                "avg_vol":     round(float(ann_v.mean()), 2),
                 "params": {
-                    "omega": round(float(res.params["omega"]), 6),
                     "alpha": round(float(res.params["alpha[1]"]), 4),
-                    "beta":  round(float(res.params["beta[1]"]), 4),
+                    "beta":  round(float(res.params["beta[1]"]),  4),
                 }
             }
     except Exception as e:
         results["garch_error"] = str(e)
 
-    # ── 3. SENTIMENT FROM NEWS HEADLINES ─────────────────────
+    # ── 3. VADER SENTIMENT ────────────────────────────────────
     try:
         from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-        news = get_news(ticker)
+        news     = get_news(ticker)
         analyzer = SentimentIntensityAnalyzer()
-        scores = []
-        headlines = []
+        scores, headlines = [], []
         for item in news[:15]:
             try:
                 ct    = item.get("content", {})
@@ -326,13 +407,12 @@ def run_ml_forecast(ticker, forecast_days):
             except: pass
 
         if scores:
-            avg = round(float(np.mean(scores)), 3)
-            sentiment_label = "BULLISH" if avg > 0.05 else ("BEARISH" if avg < -0.05 else "NEUTRAL")
+            avg   = round(float(np.mean(scores)), 3)
+            label = "BULLISH" if avg > 0.05 else ("BEARISH" if avg < -0.05 else "NEUTRAL")
             results["sentiment"] = {
-                "avg":       avg,
-                "label":     sentiment_label,
+                "avg": avg, "label": label,
                 "headlines": headlines[:10],
-                "scores":    scores,
+                "scores": scores,
             }
         else:
             results["sentiment_error"] = "No headlines available"
@@ -341,48 +421,112 @@ def run_ml_forecast(ticker, forecast_days):
 
     return results
 
+
 def build_forecast_chart(ticker, forecast_days, ml_results, current_price):
-    """Three-panel Plotly chart: direction, volatility, sentiment."""
-    has_lgb   = "lgb" in ml_results
+    """Four-panel chart: price forecast, backtest, volatility, sentiment."""
+    has_lgb   = "lgb"   in ml_results
     has_garch = "garch" in ml_results
     has_sent  = "sentiment" in ml_results
 
-    rows   = sum([has_lgb, has_garch, has_sent])
-    if rows == 0: return None
-    titles = []
-    if has_lgb:   titles.append("LightGBM — Next-Day Up Probability (%)")
-    if has_garch: titles.append("GARCH(1,1) — Annualised Volatility Forecast (%)")
-    if has_sent:  titles.append("News Sentiment Score (VADER)")
+    panel_count = 1 + int(has_lgb) + int(has_garch) + int(has_sent)
+    heights = []
+    titles  = []
+    if has_lgb:
+        heights += [0.42, 0.22]
+        titles  += [f"LightGBM — {forecast_days}d Price Forecast", "LightGBM — Backtest (last 20%)"]
+    if has_garch:
+        heights.append(0.18)
+        titles.append("GARCH(1,1) — Annualised Volatility Forecast (%)")
+    if has_sent:
+        heights.append(0.18)
+        titles.append("News Sentiment (VADER)")
 
-    fig = make_subplots(rows=rows, cols=1,
+    # Normalise heights
+    total = sum(heights)
+    heights = [h/total for h in heights]
+
+    n_rows = len(heights)
+    if n_rows == 0: return None
+
+    fig = make_subplots(rows=n_rows, cols=1,
                         subplot_titles=titles,
-                        vertical_spacing=0.12,
-                        row_heights=[1/rows]*rows)
+                        vertical_spacing=0.06,
+                        row_heights=heights)
     row = 1
 
-    # ── LIGHTGBM DIRECTION ───────────────────────────────────
+    # ── PRICE FORECAST ───────────────────────────────────────
     if has_lgb:
         lgb_r = ml_results["lgb"]
-        fd    = lgb_r["future_dir"]
-        colors = ["#00FF41" if p >= 0.5 else "#FF3333" for p in fd["prob_up"]]
-        fig.add_trace(go.Bar(
-            x=fd.index, y=fd["prob_up"] * 100,
-            marker_color=colors, name="Up Probability",
-            showlegend=False), row=row, col=1)
-        fig.add_hline(y=50, line=dict(color="#FF6600", dash="dash", width=1),
+        fdf   = lgb_r["future_df"]
+
+        # Historical last 60 days for context
+        try:
+            hist = fetch_ohlcv(ticker, "3mo")
+            if not hist.empty:
+                fig.add_trace(go.Scatter(
+                    x=hist.index, y=hist["Close"],
+                    line=dict(color="#888888", width=1.5),
+                    name="Historical", showlegend=True), row=row, col=1)
+        except: pass
+
+        # Confidence band
+        if "upper" in fdf.columns and "lower" in fdf.columns:
+            fdf_fwd = fdf.iloc[1:]
+            fig.add_trace(go.Scatter(
+                x=list(fdf_fwd.index) + list(fdf_fwd.index[::-1]),
+                y=list(fdf_fwd["upper"]) + list(fdf_fwd["lower"][::-1]),
+                fill="toself", fillcolor="rgba(255,102,0,0.12)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="Confidence Band", showlegend=False), row=row, col=1)
+
+        # Forecast line — all points including anchor
+        fig.add_trace(go.Scatter(
+            x=fdf.index, y=fdf["price"],
+            line=dict(color="#FF6600", width=2.5),
+            mode="lines+markers",
+            marker=dict(size=5, color="#FF6600"),
+            name="Forecast", showlegend=True), row=row, col=1)
+
+        # Annotate each forecast day price
+        for i, (dt, pr) in enumerate(zip(fdf.index[1:], fdf["price"].iloc[1:])):
+            chg = (pr - current_price) / current_price * 100 if current_price else 0
+            col_ann = "#00FF41" if chg >= 0 else "#FF3333"
+            fig.add_annotation(
+                x=dt, y=float(pr),
+                text=f"<b>{fp(float(pr))}</b><br><span style='font-size:9px'>{chg:+.2f}%</span>",
+                showarrow=True, arrowhead=2, arrowcolor=col_ann,
+                arrowsize=0.8, arrowwidth=1,
+                ax=0, ay=-35,
+                font=dict(size=9, color=col_ann, family="Courier New"),
+                bgcolor="rgba(0,0,0,0.7)", bordercolor=col_ann, borderwidth=0.5,
+                row=row, col=1)
+
+        # Vertical line at today
+        fig.add_vline(x=fdf.index[0], line=dict(color="#FFD700", dash="dash", width=1),
                       row=row, col=1)
-        fig.add_hline(y=55, line=dict(color="#00FF41", dash="dot", width=0.8),
-                      row=row, col=1)
-        fig.add_hline(y=45, line=dict(color="#FF3333", dash="dot", width=0.8),
-                      row=row, col=1)
-        # Backtest ROC curve as annotation
-        fig.add_annotation(
-            text=f"Accuracy: {lgb_r['acc']}%  |  AUC: {lgb_r['auc']}  |  Signal: {lgb_r['signal']}",
-            xref="paper", yref="paper",
-            x=0, y=1.0 - (row-1)/rows + 0.02/rows,
-            showarrow=False,
-            font=dict(color="#FFD700", size=10, family="Courier New"),
-            xanchor="left", row=row, col=1)
+        row += 1
+
+        # ── BACKTEST ─────────────────────────────────────────
+        bt = lgb_r["bt_df"]
+        fig.add_trace(go.Scatter(
+            x=bt.index, y=bt["actual"],
+            line=dict(color="#00FF41", width=1.5),
+            name="Actual", showlegend=True), row=row, col=1)
+        fig.add_trace(go.Scatter(
+            x=bt.index, y=bt["predicted"],
+            line=dict(color="#FF6600", width=1.5, dash="dot"),
+            name="LightGBM Backtest", showlegend=True), row=row, col=1)
+
+        # Correlation annotation
+        try:
+            corr = round(float(np.corrcoef(bt["actual"], bt["predicted"])[0,1]), 3)
+            fig.add_annotation(
+                xref="paper", yref="paper", x=0.99, y=0,
+                text=f"Backtest corr: {corr}  |  Acc: {lgb_r['acc']}%  |  AUC: {lgb_r['auc']}",
+                showarrow=False,
+                font=dict(size=9, color="#FFD700", family="Courier New"),
+                xanchor="right", row=row, col=1)
+        except: pass
         row += 1
 
     # ── GARCH VOLATILITY ─────────────────────────────────────
@@ -392,58 +536,55 @@ def build_forecast_chart(ticker, forecast_days, ml_results, current_price):
         fig.add_trace(go.Scatter(
             x=vdf.index, y=vdf["ann_vol"],
             line=dict(color="#FF6600", width=2),
-            fill="tozeroy", fillcolor="rgba(255,102,0,0.1)",
-            name="Ann. Vol Forecast", showlegend=False), row=row, col=1)
+            fill="tozeroy", fillcolor="rgba(255,102,0,0.08)",
+            name="Ann. Vol %", showlegend=False), row=row, col=1)
         fig.add_hline(y=g["current_vol"],
-                      line=dict(color="#FFD700", dash="dash", width=1),
-                      row=row, col=1)
+                      line=dict(color="#FFD700", dash="dash", width=1), row=row, col=1)
         fig.add_annotation(
-            text=f"Current: {g['current_vol']}%  |  alpha={g['params']['alpha']}  beta={g['params']['beta']}",
-            xref="paper", yref="paper",
-            x=0, y=1.0 - (row-1)/rows + 0.02/rows,
+            xref="paper", yref="paper", x=0.99, y=0,
+            text=f"Current: {g['current_vol']}%  alpha={g['params']['alpha']}  beta={g['params']['beta']}",
             showarrow=False,
-            font=dict(color="#FFD700", size=10, family="Courier New"),
-            xanchor="left", row=row, col=1)
+            font=dict(size=9, color="#FFD700", family="Courier New"),
+            xanchor="right", row=row, col=1)
         row += 1
 
     # ── SENTIMENT ────────────────────────────────────────────
     if has_sent:
         s      = ml_results["sentiment"]
-        hdlines = s["headlines"]
-        sc     = s["scores"][:len(hdlines)]
-        colors = ["#00FF41" if v > 0.05 else ("#FF3333" if v < -0.05 else "#FFD700")
-                  for v in sc]
-        labels = [h[:45]+"…" if len(h)>45 else h for h,_ in hdlines]
+        hlines = s["headlines"]
+        sc     = s["scores"][:len(hlines)]
+        colors = ["#00FF41" if v > 0.05 else ("#FF3333" if v < -0.05 else "#FFD700") for v in sc]
+        labels = [h[:50]+"…" if len(h)>50 else h for h,_ in hlines]
         fig.add_trace(go.Bar(
             x=sc, y=labels,
             orientation="h",
             marker_color=colors,
             name="Sentiment", showlegend=False), row=row, col=1)
         fig.add_vline(x=0, line=dict(color="#555", width=1), row=row, col=1)
-        fig.add_annotation(
-            text=f"Avg Score: {s['avg']}  |  Outlook: {s['label']}",
-            xref="paper", yref="paper",
-            x=0, y=1.0 - (row-1)/rows + 0.02/rows,
-            showarrow=False,
-            font=dict(color="#FFD700", size=10, family="Courier New"),
-            xanchor="left", row=row, col=1)
+
+    sig_color = "#00FF41" if ml_results.get("lgb",{}).get("signal")=="BUY" else                 "#FF3333" if ml_results.get("lgb",{}).get("signal")=="SELL" else "#FFD700"
+    sig_txt = ml_results.get("lgb",{}).get("signal","—")
+    next_r  = ml_results.get("lgb",{}).get("next_ret","—")
 
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="#000", plot_bgcolor="#0D0D0D",
         title=dict(
             text=(f"<b style='color:#FF6600'>{ticker.upper()}</b>"
-                  f"  <span style='color:#FFD700;font-size:11px'>"
-                  f"AI/ML Analysis — {forecast_days}d horizon</span>"),
-            font=dict(family="Courier New", size=13), x=0),
-        height=250 * rows + 80,
+                  f"  <span style='color:{sig_color};font-size:13px'>{sig_txt}</span>"
+                  f"  <span style='color:#555;font-size:11px'>"
+                  f"Next-day return: {next_r}%  |  {forecast_days}d horizon</span>"),
+            font=dict(family="Courier New", size=14), x=0),
+        height=220 * n_rows + 60,
+        legend=dict(orientation="h", x=0, y=1.02,
+                    bgcolor="rgba(0,0,0,0.5)",
+                    font=dict(family="Courier New", size=9)),
         font=dict(family="Courier New", color=C["gray"]),
         margin=dict(l=50, r=20, t=60, b=20))
     fig.update_xaxes(gridcolor="#1a1a1a")
     fig.update_yaxes(gridcolor="#1a1a1a")
     return fig
 
-# ── PERIOD BUTTONS (shared helper) ──────────────────────────
 def period_buttons(tab_key):
     p = st.session_state[tab_key]
     cols = st.columns([1,1,1,1,2,6])
