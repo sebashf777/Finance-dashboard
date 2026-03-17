@@ -148,266 +148,297 @@ def fc(c):
 
 # ── ML FORECASTING ───────────────────────────────────────────
 def make_features(df):
-    """Build feature matrix from OHLCV data."""
+    """Feature matrix with direction target (1=up, 0=down)."""
     d = df.copy()
     c = d["Close"]
-    d["ret1"]   = c.pct_change(1)
-    d["ret3"]   = c.pct_change(3)
-    d["ret5"]   = c.pct_change(5)
-    d["ret10"]  = c.pct_change(10)
-    d["ma5"]    = c.rolling(5).mean()
-    d["ma10"]   = c.rolling(10).mean()
-    d["ma20"]   = c.rolling(20).mean()
-    d["std5"]   = c.rolling(5).std()
-    d["std10"]  = c.rolling(10).std()
-    d["hl_pct"] = (d["High"] - d["Low"]) / c
-    d["oc_pct"] = (d["Close"] - d["Open"]) / d["Open"]
-    d["vol_ma"] = d["Volume"].rolling(10).mean()
-    d["rsi14"]  = rsi(c, 14)
-    d["target"] = c.shift(-1)
+    d["ret1"]    = c.pct_change(1)
+    d["ret3"]    = c.pct_change(3)
+    d["ret5"]    = c.pct_change(5)
+    d["ret10"]   = c.pct_change(10)
+    d["ret20"]   = c.pct_change(20)
+    d["ma5"]     = c.rolling(5).mean()
+    d["ma10"]    = c.rolling(10).mean()
+    d["ma20"]    = c.rolling(20).mean()
+    d["ma50"]    = c.rolling(50).mean()
+    d["std5"]    = c.rolling(5).std()
+    d["std10"]   = c.rolling(10).std()
+    d["std20"]   = c.rolling(20).std()
+    d["hl_pct"]  = (d["High"] - d["Low"]) / c
+    d["oc_pct"]  = (d["Close"] - d["Open"]) / d["Open"]
+    d["vol_chg"] = d["Volume"].pct_change(1)
+    d["vol_ma"]  = d["Volume"] / d["Volume"].rolling(20).mean()
+    d["rsi14"]   = rsi(c, 14)
+    d["ma5_10"]  = d["ma5"] / d["ma10"] - 1
+    d["ma10_20"] = d["ma10"] / d["ma20"] - 1
+    d["ma20_50"] = d["ma20"] / d["ma50"] - 1
+    d["bb_pos"]  = (c - c.rolling(20).mean()) / (2 * c.rolling(20).std())
+    d["target"]  = (c.shift(-1) > c).astype(int)
     d = d.dropna()
-    feat_cols = ["ret1","ret3","ret5","ret10","ma5","ma10","ma20",
-                 "std5","std10","hl_pct","oc_pct","vol_ma","rsi14"]
+    feat_cols = ["ret1","ret3","ret5","ret10","ret20",
+                 "ma5","ma10","ma20","ma50",
+                 "std5","std10","std20",
+                 "hl_pct","oc_pct","vol_chg","vol_ma",
+                 "rsi14","ma5_10","ma10_20","ma20_50","bb_pos"]
     return d[feat_cols], d["target"], d.index
 
 @st.cache_data(ttl=600)
-def run_ml_forecast(ticker, period, forecast_days):
-    """Run KNN, XGBoost, and ensemble forecast. Returns forecast df + metrics."""
+def run_ml_forecast(ticker, forecast_days):
+    """
+    Three-model ML suite:
+      1. LightGBM  — next-day direction (up/down probability)
+      2. GARCH(1,1) — volatility forecast for next N days
+      3. Sentiment  — headline sentiment score from recent news
+    """
+    results = {}
+
+    # ── 1. LIGHTGBM DIRECTION CLASSIFIER ─────────────────────
     try:
-        from sklearn.neighbors import KNeighborsRegressor
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.metrics import mean_absolute_percentage_error
-        import xgboost as xgb
+        import lightgbm as lgb
+        from sklearn.metrics import accuracy_score, roc_auc_score
+        from sklearn.calibration import CalibratedClassifierCV
 
         df = fetch_ohlcv(ticker, "2y")
-        if df.empty or len(df) < 60:
-            return None, None
+        if df.empty or len(df) < 100:
+            results["lgb_error"] = "Insufficient data"
+        else:
+            X, y, idx = make_features(df)
+            n     = len(X)
+            split = int(n * 0.8)
+            X_tr, X_te = X.iloc[:split], X.iloc[split:]
+            y_tr, y_te = y.iloc[:split], y.iloc[split:]
 
-        X, y, idx = make_features(df)
-        n = len(X)
-        split = int(n * 0.8)
+            model = lgb.LGBMClassifier(
+                n_estimators=300, max_depth=5, learning_rate=0.03,
+                subsample=0.8, colsample_bytree=0.8,
+                min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1,
+                random_state=42, verbose=-1)
+            model.fit(X_tr, y_tr,
+                      eval_set=[(X_te, y_te)],
+                      callbacks=[lgb.early_stopping(30, verbose=False),
+                                 lgb.log_evaluation(-1)])
 
-        X_train, X_test = X.iloc[:split], X.iloc[split:]
-        y_train, y_test = y.iloc[:split], y.iloc[split:]
+            y_prob = model.predict_proba(X_te)[:,1]
+            y_pred = (y_prob >= 0.5).astype(int)
 
-        scaler = StandardScaler()
-        X_tr_s = scaler.fit_transform(X_train)
-        X_te_s = scaler.transform(X_test)
+            acc = round(accuracy_score(y_te, y_pred) * 100, 1)
+            auc = round(roc_auc_score(y_te, y_prob), 3)
 
-        # KNN
-        knn = KNeighborsRegressor(n_neighbors=7, weights="distance")
-        knn.fit(X_tr_s, y_train)
-        knn_pred = knn.predict(X_te_s)
+            # Next-day prediction
+            last_X = X.iloc[[-1]]
+            next_prob = float(model.predict_proba(last_X)[0,1])
+            signal = "BUY" if next_prob >= 0.55 else ("SELL" if next_prob <= 0.45 else "HOLD")
 
-        # XGBoost
-        xgb_m = xgb.XGBRegressor(n_estimators=200, max_depth=4,
-                                   learning_rate=0.05, subsample=0.8,
-                                   colsample_bytree=0.8, random_state=42,
-                                   verbosity=0)
-        xgb_m.fit(X_train, y_train)
-        xgb_pred = xgb_m.predict(X_test)
+            # Feature importance top 5
+            fi = pd.Series(model.feature_importances_, index=X.columns)
+            top5 = fi.nlargest(5).to_dict()
 
-        # Ensemble (average)
-        ens_pred = (knn_pred + xgb_pred) / 2
+            # Walk-forward direction probabilities for next N days
+            temp_df = df.copy()
+            future_probs = [next_prob]
+            for _ in range(forecast_days - 1):
+                try:
+                    Xf, _, _ = make_features(temp_df)
+                    if Xf.empty: break
+                    p = float(model.predict_proba(Xf.iloc[[-1]])[0,1])
+                    future_probs.append(p)
+                    new_row = temp_df.iloc[-1:].copy()
+                    new_row.index = [new_row.index[-1] + pd.tseries.offsets.BDay(1)]
+                    close_chg = 1.005 if p >= 0.5 else 0.995
+                    new_row["Close"] = float(temp_df["Close"].iloc[-1]) * close_chg
+                    new_row["Open"]  = new_row["Close"]
+                    new_row["High"]  = new_row["Close"] * 1.003
+                    new_row["Low"]   = new_row["Close"] * 0.997
+                    temp_df = pd.concat([temp_df, new_row])
+                except: break
 
-        metrics = {
-            "knn_mape":  round(mean_absolute_percentage_error(y_test, knn_pred) * 100, 2),
-            "xgb_mape":  round(mean_absolute_percentage_error(y_test, xgb_pred) * 100, 2),
-            "ens_mape":  round(mean_absolute_percentage_error(y_test, ens_pred) * 100, 2),
-        }
+            last_date  = df.index[-1]
+            fut_dates  = pd.bdate_range(start=last_date + pd.tseries.offsets.BDay(1),
+                                        periods=len(future_probs))
+            future_dir = pd.DataFrame({"prob_up": future_probs}, index=fut_dates)
 
-        # Future forecast: walk-forward using last row features
-        last_price = float(df["Close"].iloc[-1])
-        future_prices_knn = [last_price]
-        future_prices_xgb = [last_price]
-
-        temp_df = df.copy()
-        for _ in range(forecast_days):
-            try:
-                Xf, _, _ = make_features(temp_df)
-                if Xf.empty: break
-                xf = Xf.iloc[[-1]]
-                xf_s = scaler.transform(xf)
-                p_knn = float(knn.predict(xf_s)[0])
-                p_xgb = float(xgb_m.predict(xf)[0])
-                future_prices_knn.append(p_knn)
-                future_prices_xgb.append(p_xgb)
-                # Append synthetic next row for rolling features
-                new_row = temp_df.iloc[-1:].copy()
-                new_row.index = [new_row.index[-1] + pd.tseries.offsets.BDay(1)]
-                new_row["Close"] = (p_knn + p_xgb) / 2
-                new_row["Open"]  = new_row["Close"]
-                new_row["High"]  = new_row["Close"] * 1.005
-                new_row["Low"]   = new_row["Close"] * 0.995
-                temp_df = pd.concat([temp_df, new_row])
-            except: break
-
-        last_date = df.index[-1]
-        future_dates = pd.bdate_range(start=last_date + pd.tseries.offsets.BDay(1),
-                                      periods=len(future_prices_knn)-1)
-        all_dates = [last_date] + list(future_dates)
-
-        forecast_df = pd.DataFrame({
-            "date":     all_dates,
-            "knn":      future_prices_knn[:len(all_dates)],
-            "xgb":      future_prices_xgb[:len(all_dates)],
-            "ensemble": [(a+b)/2 for a,b in zip(
-                future_prices_knn[:len(all_dates)],
-                future_prices_xgb[:len(all_dates)])]
-        }).set_index("date")
-
-        test_df = pd.DataFrame({
-            "date":     idx[split:],
-            "actual":   y_test.values,
-            "knn":      knn_pred,
-            "xgb":      xgb_pred,
-            "ensemble": ens_pred
-        }).set_index("date")
-
-        return forecast_df, test_df, metrics
-
+            results["lgb"] = {
+                "acc": acc, "auc": auc,
+                "next_prob": round(next_prob * 100, 1),
+                "signal": signal,
+                "top5": top5,
+                "future_dir": future_dir,
+                "backtest_dates": idx[split:],
+                "backtest_probs": y_prob,
+                "backtest_actual": y_te.values,
+            }
     except Exception as e:
-        return None, None, {"error": str(e)}
+        results["lgb_error"] = str(e)
 
-# ── CHART WITH ML ────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def build_chart(ticker="SPY", period="1mo"):
-    df = fetch_ohlcv(ticker, period)
-    if df.empty or len(df) < 2:
-        fig = go.Figure()
-        fig.add_annotation(text=f"No data for {ticker}",xref="paper",yref="paper",
-            x=0.5,y=0.5,showarrow=False,font=dict(color="#FF3333",size=14,family="Courier New"))
-        fig.update_layout(template="plotly_dark",paper_bgcolor="#000",plot_bgcolor="#0D0D0D")
-        return fig
-    c = df["Close"]
-    df["RSI"]  = rsi(c); df["MACD"],df["Sig"],df["H"] = macd(c)
-    df["BB_up"],df["BB_mid"],df["BB_lo"] = bbands(c)
-    df["EMA20"] = c.ewm(span=20,min_periods=1).mean()
-    df["EMA50"] = c.ewm(span=50,min_periods=1).mean()
-    df   = df[df["Close"].notna() & df["Open"].notna()].copy()
-    last = float(df["Close"].iloc[-1]); prev = float(df["Close"].iloc[-2])
-    chg  = last-prev; pct = chg/prev*100 if prev else 0
-    ct   = C["green"] if chg >= 0 else C["red"]
-    sign = "▲" if chg >= 0 else "▼"
-    plabel = PERIOD_LABELS.get(period, period)
-    fig = make_subplots(rows=4,cols=1,shared_xaxes=True,
-                        row_heights=[.50,.15,.18,.17],vertical_spacing=0.02)
-    fig.add_trace(go.Candlestick(x=df.index,open=df["Open"],high=df["High"],
-        low=df["Low"],close=df["Close"],
-        increasing_line_color=C["green"],decreasing_line_color=C["red"],name=ticker),row=1,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df["BB_up"],
-        line=dict(color="rgba(150,150,255,0.5)",width=1,dash="dash"),showlegend=False),row=1,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df["BB_lo"],
-        line=dict(color="rgba(150,150,255,0.5)",width=1,dash="dash"),
-        fill="tonexty",fillcolor="rgba(100,100,255,0.05)",showlegend=False),row=1,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df["EMA20"],
-        line=dict(color=C["yellow"],width=1.2),name="EMA20"),row=1,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df["EMA50"],
-        line=dict(color=C["blue"],width=1.2),name="EMA50"),row=1,col=1)
-    vcols = [C["green"] if float(cl)>=float(op) else C["red"]
-             for cl,op in zip(df["Close"],df["Open"])]
-    fig.add_trace(go.Bar(x=df.index,y=df["Volume"],
-        marker_color=vcols,showlegend=False,opacity=0.7),row=2,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df["RSI"],
-        line=dict(color=C["blue"],width=1.2),showlegend=False),row=3,col=1)
-    fig.add_hline(y=70,line=dict(color=C["red"],  dash="dash",width=0.8),row=3,col=1)
-    fig.add_hline(y=30,line=dict(color=C["green"],dash="dash",width=0.8),row=3,col=1)
-    hcols = [C["green"] if v>=0 else C["red"] for v in df["H"]]
-    fig.add_trace(go.Bar(x=df.index,y=df["H"],
-        marker_color=hcols,showlegend=False,opacity=0.7),row=4,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df["MACD"],
-        line=dict(color=C["blue"],width=1.2),name="MACD"),row=4,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=df["Sig"],
-        line=dict(color=C["orange"],width=1.2),name="Signal"),row=4,col=1)
-    fig.update_layout(
-        template="plotly_dark",paper_bgcolor="#000",plot_bgcolor="#0D0D0D",
-        title=dict(
-            text=(f"<b style='color:{C['orange']}'>{ticker.upper()}</b>"
-                  f"  <span style='color:{ct}'>{fp(last)} {sign} {fc(chg)} ({pct:+.2f}%)</span>"
-                  f"  <span style='color:#555;font-size:11px'>| {plabel}</span>"),
-            font=dict(family="Courier New",size=14),x=0),
-        height=680,xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h",x=0,y=1.02,bgcolor="rgba(0,0,0,0.5)",
-                    font=dict(family="Courier New",size=9)),
-        font=dict(family="Courier New",color=C["gray"]),
-        margin=dict(l=50,r=20,t=55,b=20))
-    fig.update_xaxes(gridcolor="#1a1a1a")
-    fig.update_yaxes(gridcolor="#1a1a1a")
-    return fig
+    # ── 2. GARCH(1,1) VOLATILITY FORECAST ────────────────────
+    try:
+        from arch import arch_model
 
-def build_forecast_chart(ticker, forecast_days, test_df, forecast_df, metrics):
-    """Standalone Plotly chart showing backtest + future forecast for all 3 models."""
-    fig = make_subplots(rows=2,cols=1,
-                        row_heights=[0.65,0.35],
-                        vertical_spacing=0.08,
-                        subplot_titles=("Price Forecast","Backtest — Last 20% of Data"))
+        df2 = fetch_ohlcv(ticker, "2y")
+        if df2.empty or len(df2) < 60:
+            results["garch_error"] = "Insufficient data"
+        else:
+            rets = df2["Close"].pct_change().dropna() * 100
+            garch = arch_model(rets, vol="Garch", p=1, q=1, dist="normal")
+            res   = garch.fit(disp="off", show_warning=False)
+            fc    = res.forecast(horizon=forecast_days, reindex=False)
+            vol_forecast = np.sqrt(fc.variance.values[-1])  # daily vol %
+            ann_vol = vol_forecast * np.sqrt(252)
+            current_vol = float(rets.rolling(20).std().iloc[-1]) * np.sqrt(252)
 
-    # ── FUTURE FORECAST (top) ───────────────────────────────
-    fig.add_trace(go.Scatter(
-        x=forecast_df.index, y=forecast_df["knn"],
-        line=dict(color="#00BFFF",width=2,dash="dot"),
-        name="KNN Forecast"),row=1,col=1)
-    fig.add_trace(go.Scatter(
-        x=forecast_df.index, y=forecast_df["xgb"],
-        line=dict(color="#FFD700",width=2,dash="dot"),
-        name="XGBoost Forecast"),row=1,col=1)
-    fig.add_trace(go.Scatter(
-        x=forecast_df.index, y=forecast_df["ensemble"],
-        line=dict(color="#FF6600",width=3),
-        name="Ensemble Forecast"),row=1,col=1)
+            last_date = df2.index[-1]
+            fut_dates = pd.bdate_range(start=last_date + pd.tseries.offsets.BDay(1),
+                                       periods=forecast_days)
+            vol_df = pd.DataFrame({
+                "daily_vol": vol_forecast,
+                "ann_vol":   ann_vol
+            }, index=fut_dates)
 
-    # Confidence band around ensemble (±2% visual only)
-    upper = forecast_df["ensemble"] * 1.02
-    lower = forecast_df["ensemble"] * 0.98
-    fig.add_trace(go.Scatter(
-        x=list(forecast_df.index)+list(forecast_df.index[::-1]),
-        y=list(upper)+list(lower[::-1]),
-        fill="toself",fillcolor="rgba(255,102,0,0.08)",
-        line=dict(color="rgba(255,255,255,0)"),
-        showlegend=False,name="Confidence Band"),row=1,col=1)
+            results["garch"] = {
+                "vol_df":      vol_df,
+                "current_vol": round(current_vol, 2),
+                "peak_vol":    round(float(ann_vol.max()), 2),
+                "avg_vol":     round(float(ann_vol.mean()), 2),
+                "params": {
+                    "omega": round(float(res.params["omega"]), 6),
+                    "alpha": round(float(res.params["alpha[1]"]), 4),
+                    "beta":  round(float(res.params["beta[1]"]), 4),
+                }
+            }
+    except Exception as e:
+        results["garch_error"] = str(e)
 
-    # Anchor dot at last known price
-    fig.add_trace(go.Scatter(
-        x=[forecast_df.index[0]], y=[forecast_df["ensemble"].iloc[0]],
-        mode="markers",marker=dict(color="#FF6600",size=10,symbol="circle"),
-        showlegend=False,name="Today"),row=1,col=1)
+    # ── 3. SENTIMENT FROM NEWS HEADLINES ─────────────────────
+    try:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-    # ── BACKTEST (bottom) ───────────────────────────────────
-    if test_df is not None:
+        news = get_news(ticker)
+        analyzer = SentimentIntensityAnalyzer()
+        scores = []
+        headlines = []
+        for item in news[:15]:
+            try:
+                ct    = item.get("content", {})
+                title = ct.get("title", item.get("title", ""))
+                if not title: continue
+                score = analyzer.polarity_scores(title)["compound"]
+                scores.append(score)
+                headlines.append((title, round(score, 3)))
+            except: pass
+
+        if scores:
+            avg = round(float(np.mean(scores)), 3)
+            sentiment_label = "BULLISH" if avg > 0.05 else ("BEARISH" if avg < -0.05 else "NEUTRAL")
+            results["sentiment"] = {
+                "avg":       avg,
+                "label":     sentiment_label,
+                "headlines": headlines[:10],
+                "scores":    scores,
+            }
+        else:
+            results["sentiment_error"] = "No headlines available"
+    except Exception as e:
+        results["sentiment_error"] = str(e)
+
+    return results
+
+def build_forecast_chart(ticker, forecast_days, ml_results, current_price):
+    """Three-panel Plotly chart: direction, volatility, sentiment."""
+    has_lgb   = "lgb" in ml_results
+    has_garch = "garch" in ml_results
+    has_sent  = "sentiment" in ml_results
+
+    rows   = sum([has_lgb, has_garch, has_sent])
+    if rows == 0: return None
+    titles = []
+    if has_lgb:   titles.append("LightGBM — Next-Day Up Probability (%)")
+    if has_garch: titles.append("GARCH(1,1) — Annualised Volatility Forecast (%)")
+    if has_sent:  titles.append("News Sentiment Score (VADER)")
+
+    fig = make_subplots(rows=rows, cols=1,
+                        subplot_titles=titles,
+                        vertical_spacing=0.12,
+                        row_heights=[1/rows]*rows)
+    row = 1
+
+    # ── LIGHTGBM DIRECTION ───────────────────────────────────
+    if has_lgb:
+        lgb_r = ml_results["lgb"]
+        fd    = lgb_r["future_dir"]
+        colors = ["#00FF41" if p >= 0.5 else "#FF3333" for p in fd["prob_up"]]
+        fig.add_trace(go.Bar(
+            x=fd.index, y=fd["prob_up"] * 100,
+            marker_color=colors, name="Up Probability",
+            showlegend=False), row=row, col=1)
+        fig.add_hline(y=50, line=dict(color="#FF6600", dash="dash", width=1),
+                      row=row, col=1)
+        fig.add_hline(y=55, line=dict(color="#00FF41", dash="dot", width=0.8),
+                      row=row, col=1)
+        fig.add_hline(y=45, line=dict(color="#FF3333", dash="dot", width=0.8),
+                      row=row, col=1)
+        # Backtest ROC curve as annotation
+        fig.add_annotation(
+            text=f"Accuracy: {lgb_r['acc']}%  |  AUC: {lgb_r['auc']}  |  Signal: {lgb_r['signal']}",
+            xref="paper", yref="paper",
+            x=0, y=1.0 - (row-1)/rows + 0.02/rows,
+            showarrow=False,
+            font=dict(color="#FFD700", size=10, family="Courier New"),
+            xanchor="left", row=row, col=1)
+        row += 1
+
+    # ── GARCH VOLATILITY ─────────────────────────────────────
+    if has_garch:
+        g   = ml_results["garch"]
+        vdf = g["vol_df"]
         fig.add_trace(go.Scatter(
-            x=test_df.index, y=test_df["actual"],
-            line=dict(color="#00FF41",width=1.5),
-            name="Actual Price"),row=2,col=1)
-        fig.add_trace(go.Scatter(
-            x=test_df.index, y=test_df["knn"],
-            line=dict(color="#00BFFF",width=1,dash="dot"),
-            name="KNN Backtest"),row=2,col=1)
-        fig.add_trace(go.Scatter(
-            x=test_df.index, y=test_df["xgb"],
-            line=dict(color="#FFD700",width=1,dash="dot"),
-            name="XGB Backtest"),row=2,col=1)
-        fig.add_trace(go.Scatter(
-            x=test_df.index, y=test_df["ensemble"],
-            line=dict(color="#FF6600",width=1.5),
-            name="Ensemble Backtest"),row=2,col=1)
+            x=vdf.index, y=vdf["ann_vol"],
+            line=dict(color="#FF6600", width=2),
+            fill="tozeroy", fillcolor="rgba(255,102,0,0.1)",
+            name="Ann. Vol Forecast", showlegend=False), row=row, col=1)
+        fig.add_hline(y=g["current_vol"],
+                      line=dict(color="#FFD700", dash="dash", width=1),
+                      row=row, col=1)
+        fig.add_annotation(
+            text=f"Current: {g['current_vol']}%  |  alpha={g['params']['alpha']}  beta={g['params']['beta']}",
+            xref="paper", yref="paper",
+            x=0, y=1.0 - (row-1)/rows + 0.02/rows,
+            showarrow=False,
+            font=dict(color="#FFD700", size=10, family="Courier New"),
+            xanchor="left", row=row, col=1)
+        row += 1
 
-    mape_text = (f"KNN MAPE: {metrics.get('knn_mape','?')}%  |  "
-                 f"XGBoost MAPE: {metrics.get('xgb_mape','?')}%  |  "
-                 f"Ensemble MAPE: {metrics.get('ens_mape','?')}%")
+    # ── SENTIMENT ────────────────────────────────────────────
+    if has_sent:
+        s      = ml_results["sentiment"]
+        hdlines = s["headlines"]
+        sc     = s["scores"][:len(hdlines)]
+        colors = ["#00FF41" if v > 0.05 else ("#FF3333" if v < -0.05 else "#FFD700")
+                  for v in sc]
+        labels = [h[:45]+"…" if len(h)>45 else h for h,_ in hdlines]
+        fig.add_trace(go.Bar(
+            x=sc, y=labels,
+            orientation="h",
+            marker_color=colors,
+            name="Sentiment", showlegend=False), row=row, col=1)
+        fig.add_vline(x=0, line=dict(color="#555", width=1), row=row, col=1)
+        fig.add_annotation(
+            text=f"Avg Score: {s['avg']}  |  Outlook: {s['label']}",
+            xref="paper", yref="paper",
+            x=0, y=1.0 - (row-1)/rows + 0.02/rows,
+            showarrow=False,
+            font=dict(color="#FFD700", size=10, family="Courier New"),
+            xanchor="left", row=row, col=1)
 
     fig.update_layout(
         template="plotly_dark",
-        paper_bgcolor="#000",plot_bgcolor="#0D0D0D",
+        paper_bgcolor="#000", plot_bgcolor="#0D0D0D",
         title=dict(
             text=(f"<b style='color:#FF6600'>{ticker.upper()}</b>"
-                  f"  <span style='color:#FFD700;font-size:11px'>ML Forecast — {forecast_days}d ahead</span>"
-                  f"<br><span style='color:#555;font-size:10px'>{mape_text}</span>"),
-            font=dict(family="Courier New",size=13),x=0),
-        height=650,
-        legend=dict(orientation="h",x=0,y=1.02,bgcolor="rgba(0,0,0,0.5)",
-                    font=dict(family="Courier New",size=9)),
-        font=dict(family="Courier New",color=C["gray"]),
-        margin=dict(l=50,r=20,t=80,b=20))
+                  f"  <span style='color:#FFD700;font-size:11px'>"
+                  f"AI/ML Analysis — {forecast_days}d horizon</span>"),
+            font=dict(family="Courier New", size=13), x=0),
+        height=250 * rows + 80,
+        font=dict(family="Courier New", color=C["gray"]),
+        margin=dict(l=50, r=20, t=60, b=20))
     fig.update_xaxes(gridcolor="#1a1a1a")
     fig.update_yaxes(gridcolor="#1a1a1a")
     return fig
@@ -678,82 +709,121 @@ with t5:
         st.markdown(
             "<div style='border-top:1px solid #FF6600;margin:16px 0 12px 0;"
             "padding-top:12px;font-family:monospace;color:#FF6600;font-size:13px;"
-            "font-weight:bold;letter-spacing:2px'>AI / ML PRICE FORECAST</div>",
+            "font-weight:bold;letter-spacing:2px'>AI / ML ANALYSIS</div>",
             unsafe_allow_html=True)
-
-        st.markdown(
-            "<div style='font-family:monospace;font-size:11px;color:#555;margin-bottom:10px'>"
-            "Models trained on 2 years of OHLCV data with 13 technical features. "
-            "Backtest uses last 20%% of data as hold-out set."
-            "</div>", unsafe_allow_html=True)
 
         col_m1, col_m2, col_m3, _ = st.columns([2,2,2,6])
         with col_m1:
-            st.markdown("<div style='background:#0D0D0D;border:1px solid #00BFFF;border-radius:4px;"
+            st.markdown("<div style='background:#0D0D0D;border:1px solid #00FF41;border-radius:4px;"
                         "padding:8px 12px;font-family:monospace'>"
-                        "<div style='color:#00BFFF;font-size:10px;font-weight:bold'>MODEL 1</div>"
-                        "<div style='color:#FFD700;font-size:13px'>KNN</div>"
-                        "<div style='color:#555;font-size:10px'>k=7, distance weighted</div>"
+                        "<div style='color:#00FF41;font-size:10px;font-weight:bold'>MODEL 1</div>"
+                        "<div style='color:#FFD700;font-size:13px'>LightGBM</div>"
+                        "<div style='color:#555;font-size:10px'>Direction classifier</div>"
                         "</div>", unsafe_allow_html=True)
         with col_m2:
-            st.markdown("<div style='background:#0D0D0D;border:1px solid #FFD700;border-radius:4px;"
-                        "padding:8px 12px;font-family:monospace'>"
-                        "<div style='color:#FFD700;font-size:10px;font-weight:bold'>MODEL 2</div>"
-                        "<div style='color:#FFD700;font-size:13px'>XGBoost</div>"
-                        "<div style='color:#555;font-size:10px'>200 trees, depth=4</div>"
-                        "</div>", unsafe_allow_html=True)
-        with col_m3:
             st.markdown("<div style='background:#0D0D0D;border:1px solid #FF6600;border-radius:4px;"
                         "padding:8px 12px;font-family:monospace'>"
-                        "<div style='color:#FF6600;font-size:10px;font-weight:bold'>ENSEMBLE</div>"
-                        "<div style='color:#FFD700;font-size:13px'>KNN + XGB</div>"
-                        "<div style='color:#555;font-size:10px'>equal weight average</div>"
+                        "<div style='color:#FF6600;font-size:10px;font-weight:bold'>MODEL 2</div>"
+                        "<div style='color:#FFD700;font-size:13px'>GARCH(1,1)</div>"
+                        "<div style='color:#555;font-size:10px'>Volatility forecast</div>"
+                        "</div>", unsafe_allow_html=True)
+        with col_m3:
+            st.markdown("<div style='background:#0D0D0D;border:1px solid #00BFFF;border-radius:4px;"
+                        "padding:8px 12px;font-family:monospace'>"
+                        "<div style='color:#00BFFF;font-size:10px;font-weight:bold'>MODEL 3</div>"
+                        "<div style='color:#FFD700;font-size:13px'>VADER Sentiment</div>"
+                        "<div style='color:#555;font-size:10px'>News headline NLP</div>"
                         "</div>", unsafe_allow_html=True)
 
-        with st.spinner(f"Running ML models for {ticker}... (this takes ~10–20 seconds)"):
+        with st.spinner(f"Running AI/ML models for {ticker}... (~15 seconds)"):
             try:
-                result = run_ml_forecast(ticker, cp5, forecast_days)
-                if result[0] is None:
-                    err = result[2].get("error","Unknown") if len(result)>2 else "Insufficient data"
-                    st.error(f"Forecast failed: {err}")
-                else:
-                    forecast_df, test_df, metrics = result
-                    st.plotly_chart(
-                        build_forecast_chart(ticker, forecast_days, test_df, forecast_df, metrics),
-                        use_container_width=True)
+                current_price = 0.0
+                try:
+                    tmp = fetch_ohlcv(ticker, "5d")
+                    if not tmp.empty: current_price = float(tmp["Close"].iloc[-1])
+                except: pass
 
-                    # Metric summary
-                    c1,c2,c3,_ = st.columns([2,2,2,6])
-                    with c1:
-                        st.markdown(
-                            f"<div style='background:#0D0D0D;border:1px solid #333;border-radius:4px;"
-                            f"padding:8px 12px;font-family:monospace'>"
-                            f"<div style='color:#555;font-size:10px'>KNN MAPE</div>"
-                            f"<div style='color:#00BFFF;font-size:18px;font-weight:bold'>"
-                            f"{metrics.get('knn_mape','?')}%</div></div>",
-                            unsafe_allow_html=True)
-                    with c2:
-                        st.markdown(
-                            f"<div style='background:#0D0D0D;border:1px solid #333;border-radius:4px;"
-                            f"padding:8px 12px;font-family:monospace'>"
-                            f"<div style='color:#555;font-size:10px'>XGBOOST MAPE</div>"
-                            f"<div style='color:#FFD700;font-size:18px;font-weight:bold'>"
-                            f"{metrics.get('xgb_mape','?')}%</div></div>",
-                            unsafe_allow_html=True)
-                    with c3:
-                        st.markdown(
-                            f"<div style='background:#0D0D0D;border:1px solid #FF6600;border-radius:4px;"
-                            f"padding:8px 12px;font-family:monospace'>"
-                            f"<div style='color:#555;font-size:10px'>ENSEMBLE MAPE</div>"
-                            f"<div style='color:#FF6600;font-size:18px;font-weight:bold'>"
-                            f"{metrics.get('ens_mape','?')}%</div></div>",
-                            unsafe_allow_html=True)
+                ml_results = run_ml_forecast(ticker, forecast_days)
+                fig_ml = build_forecast_chart(ticker, forecast_days, ml_results, current_price)
+                if fig_ml:
+                    st.plotly_chart(fig_ml, use_container_width=True)
 
+                # ── Metric cards ──────────────────────────────
+                c1, c2, c3, _ = st.columns([2,2,2,6])
+                with c1:
+                    if "lgb" in ml_results:
+                        lgb_r = ml_results["lgb"]
+                        sig_col = "#00FF41" if lgb_r["signal"]=="BUY" else ("#FF3333" if lgb_r["signal"]=="SELL" else "#FFD700")
+                        st.markdown(
+                            f"<div style='background:#0D0D0D;border:1px solid #00FF41;"
+                            f"border-radius:4px;padding:10px 12px;font-family:monospace'>"
+                            f"<div style='color:#555;font-size:10px'>LIGHTGBM SIGNAL</div>"
+                            f"<div style='color:{sig_col};font-size:22px;font-weight:bold'>"
+                            f"{lgb_r['signal']}</div>"
+                            f"<div style='color:#555;font-size:10px'>"
+                            f"Up prob: {lgb_r['next_prob']}%  |  Acc: {lgb_r['acc']}%  |  AUC: {lgb_r['auc']}</div>"
+                            f"</div>", unsafe_allow_html=True)
+                    elif "lgb_error" in ml_results:
+                        st.error(f"LightGBM: {ml_results['lgb_error']}")
+
+                with c2:
+                    if "garch" in ml_results:
+                        g = ml_results["garch"]
+                        vol_col = "#FF3333" if g["avg_vol"] > 30 else ("#FFD700" if g["avg_vol"] > 20 else "#00FF41")
+                        st.markdown(
+                            f"<div style='background:#0D0D0D;border:1px solid #FF6600;"
+                            f"border-radius:4px;padding:10px 12px;font-family:monospace'>"
+                            f"<div style='color:#555;font-size:10px'>GARCH — AVG FORECAST VOL</div>"
+                            f"<div style='color:{vol_col};font-size:22px;font-weight:bold'>"
+                            f"{g['avg_vol']}%</div>"
+                            f"<div style='color:#555;font-size:10px'>"
+                            f"Current: {g['current_vol']}%  |  Peak: {g['peak_vol']}%</div>"
+                            f"</div>", unsafe_allow_html=True)
+                    elif "garch_error" in ml_results:
+                        st.error(f"GARCH: {ml_results['garch_error']}")
+
+                with c3:
+                    if "sentiment" in ml_results:
+                        s = ml_results["sentiment"]
+                        sent_col = "#00FF41" if s["label"]=="BULLISH" else ("#FF3333" if s["label"]=="BEARISH" else "#FFD700")
+                        st.markdown(
+                            f"<div style='background:#0D0D0D;border:1px solid #00BFFF;"
+                            f"border-radius:4px;padding:10px 12px;font-family:monospace'>"
+                            f"<div style='color:#555;font-size:10px'>NEWS SENTIMENT</div>"
+                            f"<div style='color:{sent_col};font-size:22px;font-weight:bold'>"
+                            f"{s['label']}</div>"
+                            f"<div style='color:#555;font-size:10px'>"
+                            f"Score: {s['avg']}  |  Headlines: {len(s['headlines'])}</div>"
+                            f"</div>", unsafe_allow_html=True)
+                    elif "sentiment_error" in ml_results:
+                        st.warning(f"Sentiment: {ml_results['sentiment_error']}")
+
+                # ── Top features from LightGBM ────────────────
+                if "lgb" in ml_results and ml_results["lgb"].get("top5"):
                     st.markdown(
-                        "<div style='font-family:monospace;font-size:10px;color:#444;margin-top:8px'>"
-                        "MAPE = Mean Absolute Percentage Error on hold-out test set. "
-                        "Lower is better. Forecasts are indicative only — not financial advice."
-                        "</div>", unsafe_allow_html=True)
+                        "<div style='font-family:monospace;font-size:11px;color:#555;"
+                        "margin-top:12px;margin-bottom:4px'>TOP PREDICTIVE FEATURES (LightGBM)</div>",
+                        unsafe_allow_html=True)
+                    top5 = ml_results["lgb"]["top5"]
+                    max_v = max(top5.values()) if top5 else 1
+                    cols5 = st.columns(len(top5))
+                    for i, (feat, val) in enumerate(top5.items()):
+                        pct = round(val / max_v * 100)
+                        with cols5[i]:
+                            st.markdown(
+                                f"<div style='background:#0D0D0D;border:1px solid #333;"
+                                f"border-radius:4px;padding:6px 10px;font-family:monospace;"
+                                f"text-align:center'>"
+                                f"<div style='color:#FF6600;font-size:10px'>{feat}</div>"
+                                f"<div style='color:#FFD700;font-size:13px;font-weight:bold'>{pct}%</div>"
+                                f"</div>", unsafe_allow_html=True)
+
+                st.markdown(
+                    "<div style='font-family:monospace;font-size:10px;color:#333;margin-top:12px'>"
+                    "Not financial advice. Models trained on historical data. Past performance "
+                    "does not guarantee future results."
+                    "</div>", unsafe_allow_html=True)
+
             except Exception as e:
                 st.error(f"ML error: {e}")
 
