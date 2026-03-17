@@ -310,9 +310,10 @@ def run_ml_forecast(ticker, forecast_days):
 
             results["lgb"] = {
                 "mape":      mape_1step,
+                "acc":       dir_acc,
                 "dir_acc":   dir_acc,
-                "next_ret":  round(next_ret*100, 3),
                 "prob":      round(float(np.mean(pred_rets > 0)) * 100, 1),
+                "next_ret":  round(next_ret*100, 3),
                 "signal":    signal,
                 "top5":      top5,
                 "fdf":       fdf,
@@ -593,21 +594,19 @@ def build_chart(ticker="SPY", period="1mo"):
         fig.update_layout(template="plotly_dark", paper_bgcolor="#000", plot_bgcolor="#0D0D0D")
         return fig
     c = df["Close"]
-    df["RSI"]  = rsi(c)
+    df["RSI"] = rsi(c)
     df["MACD"], df["Sig"], df["H"] = macd(c)
     df["BB_up"], df["BB_mid"], df["BB_lo"] = bbands(c)
     df["EMA20"] = c.ewm(span=20, min_periods=1).mean()
     df["EMA50"] = c.ewm(span=50, min_periods=1).mean()
     df   = df[df["Close"].notna() & df["Open"].notna()].copy()
-    last = float(df["Close"].iloc[-1])
-    prev = float(df["Close"].iloc[-2])
-    chg  = last - prev
-    pct  = chg / prev * 100 if prev else 0
+    last = float(df["Close"].iloc[-1]); prev = float(df["Close"].iloc[-2])
+    chg  = last - prev; pct = chg / prev * 100 if prev else 0
     ct   = C["green"] if chg >= 0 else C["red"]
     sign = "▲" if chg >= 0 else "▼"
     plabel = PERIOD_LABELS.get(period, period)
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
-                        row_heights=[.50, .15, .18, .17], vertical_spacing=0.02)
+                        row_heights=[.50,.15,.18,.17], vertical_spacing=0.02)
     fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
         low=df["Low"], close=df["Close"],
         increasing_line_color=C["green"], decreasing_line_color=C["red"],
@@ -1274,54 +1273,3 @@ with t7:
 
             except Exception as e:
                 st.error(f"ML error: {e}")
-
-with t6:
-    rc6, _ = st.columns([1,11])
-    with rc6:
-        if st.button("Refresh", key="rm2"): st.cache_data.clear()
-    mp = period_buttons("macro_period")
-    with st.spinner("Building macro dashboard..."):
-        fig = build_macro(mp); st.pyplot(fig,use_container_width=True); plt.close(fig)
-
-with t7:
-    ntk = st.text_input("Ticker", value="SPY", key="nt2").upper()
-    if ntk:
-        q   = batch_quotes((ntk,)).get(ntk, dict(price=0,chg=0,pct=0))
-        col = "#00FF41" if q["chg"] >= 0 else "#FF3333"
-        sgn = "▲" if q["chg"] >= 0 else "▼"
-        st.markdown(
-            f"<div style='font-family:monospace;padding:8px 0'>"
-            f"<span style='color:#FFD700;font-size:22px;font-weight:bold'>{ntk}</span>"
-            f"&nbsp;&nbsp;<span style='color:{col};font-size:18px'>"
-            f"{fp(q['price'])} {sgn} {fc(q['chg'])} ({q['pct']:+.2f}%)</span></div>",
-            unsafe_allow_html=True)
-        with st.spinner(f"Loading news for {ntk}..."):
-            news = get_news(ntk)
-            rows = ""
-            for item in news:
-                try:
-                    ct    = item.get("content", {})
-                    title = ct.get("title", item.get("title","No title"))
-                    pub   = ct.get("pubDate","")[:10]
-                    prov  = ct.get("provider",{})
-                    src   = prov.get("displayName","") if isinstance(prov,dict) else ""
-                    rows += (f"<tr style='border-bottom:1px solid #1a1a1a'>"
-                             f"<td style='padding:8px 14px;color:#CCC;font-size:12px;"
-                             f"line-height:1.5'>{title}</td>"
-                             f"<td style='padding:8px 14px;white-space:nowrap;font-size:11px'>"
-                             f"<span style='color:#555'>{pub}</span>"
-                             + (f"<span style='color:#FF6600'> | {src}</span>" if src else "")
-                             + "</td></tr>")
-                except: continue
-            if rows:
-                st.markdown(
-                    f"<div style='background:#000;font-family:Courier New,monospace;"
-                    f"padding:14px;border:1px solid #FF6600;border-radius:4px'>"
-                    f"<table style='width:100%;border-collapse:collapse'>"
-                    f"<thead><tr style='border-bottom:2px solid #FF6600'>"
-                    f"<th style='color:#FF6600;text-align:left;padding:6px 14px'>HEADLINE</th>"
-                    f"<th style='color:#FF6600;text-align:left;padding:6px 14px'>DATE / SOURCE</th>"
-                    f"</tr></thead><tbody>{rows}</tbody></table></div>",
-                    unsafe_allow_html=True)
-            else:
-                st.warning("No news available.")
