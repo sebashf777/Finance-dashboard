@@ -10,3 +10,4 @@ lightgbm>=4.0.0
 arch>=6.0.0
 vaderSentiment>=3.3.2
 tzdata
+ 
