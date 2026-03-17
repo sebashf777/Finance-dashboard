@@ -439,11 +439,10 @@ def period_buttons(tab_key):
         unsafe_allow_html=True)
     return p
 
-def html_table(title, sections, icon, period="1mo"):
+def html_table(title, sections, icon, period=None):
     tks    = [tk for sec in sections.values() for tk in sec.values()]
-    quotes = batch_quotes_period(tuple(tks), period)
+    quotes = batch_quotes(tuple(tks))
     now    = ny_now().strftime("%I:%M %p ET")
-    plabel = PERIOD_LABELS.get(period, period)
     rows   = ""
     for sec_name, items in sections.items():
         rows += (f"<tr><td colspan='5' style='background:#111122;color:#FF6600;"
@@ -460,7 +459,7 @@ def html_table(title, sections, icon, period="1mo"):
                      f"<td style='color:{col};padding:7px 14px'>{q['pct']:+.2f}%</td>"
                      f"<td style='color:#444;padding:7px 14px;font-size:10px'>{tk}</td></tr>")
     hdr = "".join(f"<th style='color:#FF6600;text-align:left;padding:6px 14px'>{h}</th>"
-                  for h in ["NAME","PRICE",f"CHG ({plabel})","CHG%","TICKER"])
+                  for h in ["NAME","PRICE","CHANGE","CHG%","TICKER"])
     return (f"<div style='background:#000;font-family:Courier New,monospace;padding:14px;"
             f"border:1px solid #FF6600;border-radius:4px;margin-top:8px'>"
             f"<div style='color:#FF6600;font-size:13px;font-weight:bold;border-bottom:1px solid #333;"
@@ -473,8 +472,7 @@ def html_table(title, sections, icon, period="1mo"):
 
 def build_global(period="1mo"):
     tks    = tuple(tk for reg in GLOBAL_INDICES.values() for tk in reg.values())
-    quotes = batch_quotes_period(tks, period)
-    plabel = PERIOD_LABELS.get(period, period)
+    quotes = batch_quotes(tks)
     fig    = plt.figure(figsize=(16,9), facecolor=C["bg"])
     gs     = gridspec.GridSpec(2,2, figure=fig, hspace=0.52, wspace=0.3)
     rcols  = [C["blue"],"#8888ff",C["orange"],"#ffaa00"]
@@ -501,7 +499,7 @@ def build_global(period="1mo"):
                     fontweight="bold",fontfamily="monospace",transform=ax.transAxes)
             ax.text(cx,cy-bh*.28,f"{sign} {q['pct']:+.2f}%",ha="center",color=col,
                     fontsize=7,fontfamily="monospace",transform=ax.transAxes)
-    plt.suptitle(f"GLOBAL EQUITY MARKETS  —  {plabel} Change",
+    plt.suptitle("GLOBAL EQUITY MARKETS",
                  color=C["orange"],fontsize=14,fontweight="bold",fontfamily="monospace",y=0.99)
     plt.tight_layout(pad=1.5,rect=[0,0,1,0.97])
     return fig
@@ -614,39 +612,27 @@ st.markdown(
 t1,t2,t3,t4,t5,t6,t7 = st.tabs(["GLOBAL","FOREX","COMMODITIES","CRYPTO","CHART","MACRO","NEWS"])
 
 with t1:
-    rc1, _ = st.columns([1,11])
-    with rc1:
-        if st.button("Refresh", key="rg"): st.cache_data.clear()
-    gp = period_buttons("global_period")
+    if st.button("🔄 Refresh", key="rg"): st.cache_data.clear()
     with st.spinner("Loading global markets..."):
-        fig = build_global(gp); st.pyplot(fig,use_container_width=True); plt.close(fig)
+        fig = build_global("1mo"); st.pyplot(fig,use_container_width=True); plt.close(fig)
 
 with t2:
-    rc2, _ = st.columns([1,11])
-    with rc2:
-        if st.button("Refresh", key="rf"): st.cache_data.clear()
-    fp2 = period_buttons("forex_period")
+    if st.button("🔄 Refresh", key="rf"): st.cache_data.clear()
     with st.spinner("Fetching forex..."):
         st.markdown(html_table("FOREX - CURRENCY MARKETS",
-            {"MAJOR PAIRS":FOREX_MAJOR,"EMERGING MARKETS":FOREX_EM},"FX",fp2),
+            {"MAJOR PAIRS":FOREX_MAJOR,"EMERGING MARKETS":FOREX_EM},"FX","1mo"),
             unsafe_allow_html=True)
 
 with t3:
-    rc3, _ = st.columns([1,11])
-    with rc3:
-        if st.button("Refresh", key="rc"): st.cache_data.clear()
-    cp3 = period_buttons("commodities_period")
+    if st.button("🔄 Refresh", key="rc"): st.cache_data.clear()
     with st.spinner("Fetching commodities..."):
-        st.markdown(html_table("GLOBAL COMMODITIES",COMMODITIES,"C",cp3),
+        st.markdown(html_table("GLOBAL COMMODITIES",COMMODITIES,"C","1mo"),
             unsafe_allow_html=True)
 
 with t4:
-    rc4, _ = st.columns([1,11])
-    with rc4:
-        if st.button("Refresh", key="rk"): st.cache_data.clear()
-    cp4 = period_buttons("crypto_period")
+    if st.button("🔄 Refresh", key="rk"): st.cache_data.clear()
     with st.spinner("Fetching crypto..."):
-        st.markdown(html_table("CRYPTOCURRENCY MARKETS",CRYPTO,"B",cp4),
+        st.markdown(html_table("CRYPTOCURRENCY MARKETS",CRYPTO,"B","1mo"),
             unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
